@@ -1,0 +1,88 @@
+import pandas as pd
+from collections import OrderedDict
+import json
+
+# ---- CONFIG ----
+ICN_COL    = "ICN"
+STATUS_COL = "Status"
+REMARK_COL = "remark_code"
+CAT1_COL   = "ABRV_FNL_CATG"
+CAT2_COL   = "ABRV_FNL_CATG1"
+TOP_N      = 10
+
+dfc = df.copy()
+
+# ---- 1) One status per claim (precedence) ----
+precedence = OrderedDict({"Denied":3, "Partially Denied":2, "Paid":1})
+dfc["_rank"] = dfc[STATUS_COL].map(precedence).fillna(0)
+
+claim_status = (
+    dfc.sort_values("_rank", ascending=False)
+       .drop_duplicates([ICN_COL])[[ICN_COL, STATUS_COL]]
+)
+total_claims = claim_status[ICN_COL].nunique()
+status_dist  = claim_status[STATUS_COL].value_counts().to_dict()
+denied_den   = int(status_dist.get("Denied", 0))
+partial_den  = int(status_dist.get("Partially Denied", 0))
+
+# ---- 2) Claim-level remark codes (dedupe per claim+code) ----
+claim_level_remarks = (
+    dfc[[ICN_COL, REMARK_COL, CAT1_COL, CAT2_COL]]
+      .dropna(subset=[REMARK_COL])
+      .drop_duplicates([ICN_COL, REMARK_COL])
+)
+
+# For mapping each remark code -> first seen category values
+cat_map = (claim_level_remarks
+           .drop_duplicates([REMARK_COL])
+           .set_index(REMARK_COL)[[CAT1_COL, CAT2_COL]]
+           .fillna("")
+           .to_dict(orient="index"))
+
+# ---- 3) Top remark codes overall ----
+remark_counts = (claim_level_remarks
+                 .groupby(REMARK_COL)[ICN_COL]
+                 .nunique()
+                 .sort_values(ascending=False)
+                 .rename("claims")
+                 .reset_index())
+
+top_remark_codes = (
+    remark_counts.head(TOP_N)
+                 .apply(lambda r: {
+                     "code": r[REMARK_COL],
+                     "claims": int(r["claims"]),
+                     "category_1": cat_map.get(r[REMARK_COL], {}).get(CAT1_COL, ""),
+                     "category_2": cat_map.get(r[REMARK_COL], {}).get(CAT2_COL, "")
+                 }, axis=1)
+                 .tolist()
+)
+
+# ---- 4) Category drivers (overall + within Denied / Partial) ----
+remarks_with_status = claim_level_remarks.merge(claim_status, on=ICN_COL, how="left")
+
+def cat_counts(df_slice, colname):
+    s = (df_slice.groupby(colname)[ICN_COL]
+                 .nunique()
+                 .sort_values(ascending=False)
+                 .rename("claims"))
+    return [{"category": idx if pd.notnull(idx) else "Uncategorized", "claims": int(val)}
+            for idx, val in s.items()]
+
+category_overall   = cat_counts(remarks_with_status, CAT1_COL)
+denial_categories  = cat_counts(remarks_with_status.query(f'{STATUS_COL} == "Denied"'), CAT1_COL) if denied_den>0 else []
+partial_categories = cat_counts(remarks_with_status.query(f'{STATUS_COL} == "Partially Denied"'), CAT1_COL) if partial_den>0 else []
+
+# ---- 5) Payload ----
+summary_payload = {
+    "totals": {
+        "distinct_claims": int(total_claims),
+        "status_distribution": {k:int(v) for k,v in status_dist.items()}
+    },
+    "category_overall": category_overall,
+    "denial_categories": denial_categories,
+    "partial_denial_categories": partial_categories,
+    "top_remark_codes": top_remark_codes
+}
+
+print(json.dumps(summary_payload, indent=2))
